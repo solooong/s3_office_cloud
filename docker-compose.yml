@@ -1,0 +1,511 @@
+# =============================================================================
+#  Cloud Suite — production stack
+#  Nextcloud 35 (S3 primary storage on SeaweedFS) + ONLYOFFICE Docs 8.3.3
+#  Nginx Proxy Manager (TLS + GUI) + PostgreSQL 17 + Redis 8
+#  ---------------------------------------------------------------------------
+#  Стек рассчитан на один сервер (Ubuntu 24.04 LTS / Debian 12), установку
+#  и обновление выполняйте через Makefile:  make bootstrap && make up
+#  Полное описание: docs/02-deployment.md, интерфейсы: CONTRACT.md
+#
+#  Ключевые архитектурные решения:
+#   * Файлы пользователей хранятся в S3 (SeaweedFS), а не на локальном диске
+#     Nextcloud — это и есть замена Яндекс.Диска на S3-совместимое хранилище.
+#   * TLS и авторизация — Nginx Proxy Manager (GUI), внутренний nginx (web)
+#     только проксирует PHP-FPM и отдаёт статику.
+#   * Секреты приходят только из .env; файл .env в git не попадает.
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-cloudsuite}
+
+# --- Общие настройки логирования (ротация на уровне docker) -----------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-service: &default-service
+  restart: unless-stopped
+  logging: *default-logging
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 60s
+
+# =============================================================================
+#  Сети: фиксированные подсети обязательны
+#   * edge    — публичный слой (proxy, web, app, onlyoffice), есть выход в интернет
+#   * backend — внутренняя сеть без выхода наружу (db, cache, s3)
+#  trusted_proxies в Nextcloud = 172.28.10.0/24, адрес proxy = 172.28.10.10
+# =============================================================================
+networks:
+  edge:
+    name: ${COMPOSE_PROJECT_NAME:-cloudsuite}_edge
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+  backend:
+    name: ${COMPOSE_PROJECT_NAME:-cloudsuite}_backend
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.20.0/24
+
+# =============================================================================
+#  Именованные тома. Резервное копирование обязательно для:
+#   db_data, s3_data, nextcloud_html, nextcloud_data, proxy_data, proxy_letsencrypt
+#  (см. scripts/backup.sh, docs/07-backup-restore-dr.md)
+# =============================================================================
+volumes:
+  nextcloud_html:
+  nextcloud_data:
+  db_data:
+  redis_data:
+  s3_data:
+  onlyoffice_data:
+  onlyoffice_logs:
+  onlyoffice_lib:
+  proxy_data:
+  proxy_letsencrypt:
+
+services:
+  # ===========================================================================
+  #  1. Входная точка: Nginx Proxy Manager (TLS, Let's Encrypt, GUI, access lists)
+  #     GUI: http://127.0.0.1:8181 (по умолчанию только через SSH-туннель)
+  # ===========================================================================
+  proxy:
+    <<: *default-service
+    image: jc21/nginx-proxy-manager:${NPM_VERSION:-2.16.0}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-proxy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      # Админ-панель NPM: только loopback. Наружу — через SSH-туннель.
+      - "${NPM_ADMIN_BIND:-127.0.0.1}:${NPM_ADMIN_PORT:-8181}:81"
+    environment:
+      TZ: ${TZ:-UTC}
+      DISABLE_IPV6: "true"
+      # Первичный администратор создаётся автоматически при пустой БД
+      # (иначе NPM показал бы мастер первичной настройки в браузере).
+      INITIAL_ADMIN_EMAIL: ${NPM_ADMIN_EMAIL:?NPM_ADMIN_EMAIL is not set}
+      INITIAL_ADMIN_PASSWORD: ${NPM_ADMIN_PASSWORD:?NPM_ADMIN_PASSWORD is not set}
+    volumes:
+      - proxy_data:/data
+      - proxy_letsencrypt:/etc/letsencrypt
+    networks:
+      edge:
+        ipv4_address: ${PROXY_IP:-172.28.10.10}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:81/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    depends_on:
+      web:
+        condition: service_healthy
+      onlyoffice:
+        condition: service_started
+    stop_grace_period: 30s
+
+  # ===========================================================================
+  #  2. Внутренний nginx: FastCGI -> app:9000, статика Nextcloud, /status
+  #     TLS здесь НЕ терминируется (этим занимается proxy/NPM).
+  # ===========================================================================
+  web:
+    <<: *default-service
+    image: nginx:${NGINX_VERSION:-1.29-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-web
+    environment:
+      TZ: ${TZ:-UTC}
+      # Значения подставляются в /etc/nginx/templates/**/*.template (envsubst)
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:-10G}
+      CLOUD_DOMAIN: ${CLOUD_DOMAIN:?CLOUD_DOMAIN is not set}
+      OFFICE_DOMAIN: ${OFFICE_DOMAIN:?OFFICE_DOMAIN is not set}
+      NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates
+      # Шаблоны рендерятся в writable tmpfs (/var/run), conf.d монтируется ro
+      NGINX_ENVSUBST_OUTPUT_DIR: /var/run
+    volumes:
+      # Статика Nextcloud только для чтения; data/ никогда не отдаётся наружу
+      - nextcloud_html:/var/www/html:ro
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./config/nginx/templates:/etc/nginx/templates:ro
+      - ./config/nginx/snippets:/etc/nginx/snippets:ro
+      - ./logs/nginx:/var/log/nginx
+    tmpfs:
+      - /var/cache/nginx:size=256m
+      - /var/run:size=16m
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # ===========================================================================
+  #  3. Nextcloud (PHP-FPM). Файлы — в S3 (SeaweedFS), метаданные — PostgreSQL,
+  #     кэш/блокировки — Redis, офис — ONLYOFFICE, аудит — admin_audit.
+  # ===========================================================================
+  app:
+    <<: *default-service
+    image: nextcloud:${NEXTCLOUD_VERSION:-35.0.2-fpm}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-app
+    environment:
+      TZ: ${TZ:-UTC}
+      # --- База данных ------------------------------------------------------
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}
+      # --- Кэш и блокировки (Redis) ----------------------------------------
+      REDIS_HOST: cache
+      REDIS_HOST_PORT: "6379"
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set}
+      # --- Первичное объектное хранилище S3 (SeaweedFS) --------------------
+      OBJECTSTORE_S3_BUCKET: ${S3_BUCKET:-nextcloud}
+      OBJECTSTORE_S3_HOST: s3
+      OBJECTSTORE_S3_PORT: "${SEAWEEDFS_S3_PORT:-8333}"
+      OBJECTSTORE_S3_REGION: ${S3_REGION:-us-east-1}
+      OBJECTSTORE_S3_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is not set}
+      OBJECTSTORE_S3_SECRET: ${S3_SECRET_KEY:?S3_SECRET_KEY is not set}
+      # ВАЖНО: образ nextcloud читает именно OBJECTSTORE_S3_SSL
+      # (OBJECTSTORE_S3_USE_SSL игнорируется и SSL остаётся включённым)
+      OBJECTSTORE_S3_SSL: "false"
+      OBJECTSTORE_S3_USEPATH_STYLE: ${S3_USE_PATH_STYLE:-true}
+      OBJECTSTORE_S3_AUTOCREATE: "false"
+      # --- Экземпляр и обратный прокси -------------------------------------
+      NEXTCLOUD_TRUSTED_DOMAINS: "${NEXTCLOUD_TRUSTED_DOMAINS}"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-172.28.10.0/24}"
+      FORWARDED_FOR_HEADERS: HTTP_X_FORWARDED_FOR
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: ${CLOUD_DOMAIN}
+      OVERWRITECLIURL: https://${CLOUD_DOMAIN}
+      # --- Первичная установка (используется только при первом запуске) -----
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:?NEXTCLOUD_ADMIN_USER is not set}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?NEXTCLOUD_ADMIN_PASSWORD is not set}
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:-1G}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:-10G}
+      PHP_OPCACHE_MEMORY_CONSUMPTION: 256
+      # --- Почта (включается, когда SMTP_HOST задан) ------------------------
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-tls}
+      SMTP_NAME: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_AUTHTYPE: LOGIN
+      MAIL_FROM_ADDRESS: ${SMTP_FROM:-cloud@example.com}
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-example.com}
+      # --- Служебное --------------------------------------------------------
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      VERSIONS_MAX: ${VERSIONS_MAX:-20}
+    volumes:
+      # Код Nextcloud + config.php + приложения
+      - nextcloud_html:/var/www/html
+      # Аппаратные данные: previews, avatars, appdata (сами файлы — в S3)
+      - nextcloud_data:/var/www/html/data
+      # Дополнительные ini-настройки PHP (лимиты задаются через env)
+      - ./config/nextcloud/php.ini:/usr/local/etc/php/conf.d/zz-cloudsuite.ini:ro
+      # Хуки entrypoint'а образа (config-injection + права на config/)
+      - ./config/nextcloud/hooks:/docker-entrypoint-hooks.d:ro
+      # Вспомогательные файлы Cloud Suite (config/, custom/) — одним ro-каталогом
+      - ./config/nextcloud:/opt/cloudsuite:ro
+      # Логи: nextcloud.log + audit.log (ротация — config/logrotate/cloudsuite)
+      - ./logs/cloudsuite:/var/log/cloudsuite
+    networks:
+      - edge
+      - backend
+    # Server-side вызовы (OnlyOffice -> Nextcloud) не должны выходить в интернет
+    extra_hosts:
+      - "${CLOUD_DOMAIN}:${PROXY_IP:-172.28.10.10}"
+      - "${OFFICE_DOMAIN}:${PROXY_IP:-172.28.10.10}"
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  #  4. Cron-контейнер Nextcloud (фоновые задачи: сканирование, версии,
+  #     очистка корзины, уведомления). Работает от www-data, а не от root.
+  # ===========================================================================
+  cron:
+    <<: *default-service
+    image: nextcloud:${NEXTCLOUD_VERSION:-35.0.2-fpm}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-cron
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        echo "[cron] nextcloud background jobs every ${CRON_INTERVAL_SECONDS:-300}s"
+        while true; do
+          su -p www-data -s /bin/sh -c "php -f /var/www/html/cron.php" || echo "[cron] run failed, retrying in ${CRON_INTERVAL_SECONDS:-300}s" >&2
+          sleep "${CRON_INTERVAL_SECONDS:-300}"
+        done
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      REDIS_HOST: cache
+      REDIS_HOST_PORT: "6379"
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD:?}
+      OBJECTSTORE_S3_BUCKET: ${S3_BUCKET:-nextcloud}
+      OBJECTSTORE_S3_HOST: s3
+      OBJECTSTORE_S3_PORT: "${SEAWEEDFS_S3_PORT:-8333}"
+      OBJECTSTORE_S3_REGION: ${S3_REGION:-us-east-1}
+      OBJECTSTORE_S3_KEY: ${S3_ACCESS_KEY:?}
+      OBJECTSTORE_S3_SECRET: ${S3_SECRET_KEY:?}
+      # ВАЖНО: образ nextcloud читает именно OBJECTSTORE_S3_SSL
+      # (OBJECTSTORE_S3_USE_SSL игнорируется и SSL остаётся включённым)
+      OBJECTSTORE_S3_SSL: "false"
+      OBJECTSTORE_S3_USEPATH_STYLE: ${S3_USE_PATH_STYLE:-true}
+      OBJECTSTORE_S3_AUTOCREATE: "false"
+      NEXTCLOUD_TRUSTED_DOMAINS: "${NEXTCLOUD_TRUSTED_DOMAINS}"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-172.28.10.0/24}"
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: ${CLOUD_DOMAIN}
+      OVERWRITECLIURL: https://${CLOUD_DOMAIN}
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:-1G}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:-10G}
+      VERSIONS_MAX: ${VERSIONS_MAX:-20}
+    volumes:
+      - nextcloud_html:/var/www/html
+      - nextcloud_data:/var/www/html/data
+      - ./config/nextcloud/php.ini:/usr/local/etc/php/conf.d/zz-cloudsuite.ini:ro
+      # Вспомогательные файлы Cloud Suite одним read-only каталогом:
+      #   /opt/cloudsuite/config/*.config.php  — копируются хуком 10-extra-config.sh
+      #   /opt/cloudsuite/custom/prune-versions.php — ограничение версий
+      - ./config/nextcloud:/opt/cloudsuite:ro
+      # Хуки entrypoint'а образа (config-injection + права на config/)
+      - ./config/nextcloud/hooks:/docker-entrypoint-hooks.d:ro
+      - ./logs/cloudsuite:/var/log/cloudsuite
+    networks:
+      - edge
+      - backend
+    extra_hosts:
+      - "${CLOUD_DOMAIN}:${PROXY_IP:-172.28.10.10}"
+      - "${OFFICE_DOMAIN}:${PROXY_IP:-172.28.10.10}"
+    healthcheck:
+      test: ["CMD", "test", "-r", "/var/www/html/cron.php"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+
+  # ===========================================================================
+  #  5. PostgreSQL — метаданные Nextcloud (файлы НЕ здесь, они в S3)
+  # ===========================================================================
+  db:
+    <<: *default-service
+    image: postgres:${POSTGRES_VERSION:-17.11-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-db
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=100
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - timezone=${TZ:-UTC}
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    shm_size: 256mb
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 120s
+
+  # ===========================================================================
+  #  6. Redis — distributed cache + file locking (обязателен для S3-хранилища,
+  #     иначе возможны гонки при параллельной записи)
+  # ===========================================================================
+  cache:
+    <<: *default-service
+    image: redis:${REDIS_VERSION:-8.4.7-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-cache
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is not set}
+    environment:
+      TZ: ${TZ:-UTC}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    volumes:
+      - redis_data:/data
+      - ./config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    sysctls:
+      net.core.somaxconn: 1024
+    stop_grace_period: 30s
+
+  # ===========================================================================
+  #  7. SeaweedFS — S3-совместимое объектное хранилище (замена Яндекс.Диска).
+  #     master :9333, volume :8080, filer :8888, S3 API :8333 (только backend)
+  #     Админ-порты доступны только на loopback: ssh -L 8888:127.0.0.1:8888
+  # ===========================================================================
+  s3:
+    <<: *default-service
+    image: chrislusf/seaweedfs:${SEAWEEDFS_VERSION:-latest}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-s3
+    command:
+      - server
+      - -dir=/data
+      - -master.port=9333
+      - -master.volumeSizeLimitMB=${SEAWEEDFS_VOLUME_SIZE_MB:-30720}
+      - -volume.port=8080
+      - -filer
+      - -filer.port=8888
+      - -s3
+      - -s3.port=${SEAWEEDFS_S3_PORT:-8333}
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - s3_data:/data
+    ports:
+      # Только loopback — для администрирования через SSH-туннель
+      - "127.0.0.1:9333:9333"
+      - "127.0.0.1:${SEAWEEDFS_FILER_PORT:-8888}:8888"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:9333/cluster/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 60s
+
+  # ===========================================================================
+  #  8. Инициализация S3: S3-идентичность Nextcloud + бакет.
+  #     Идемпотентно: повторный запуск безопасен. Секреты не попадают в лог.
+  #     (SeaweedFS 4.x хранит S3-конфигурацию в filer, а не в -s3.config)
+  # ===========================================================================
+  s3-init:
+    image: chrislusf/seaweedfs:${SEAWEEDFS_VERSION:-latest}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-s3-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "[s3-init] waiting for SeaweedFS master..."
+        i=0
+        until curl -fsS -o /dev/null http://s3:9333/cluster/status; do
+          i=$((i+1)); [ "$${i}" -le 60 ] || { echo "[s3-init] SeaweedFS did not start" >&2; exit 1; }
+          sleep 2
+        done
+        echo "[s3-init] applying S3 identity '$${S3_USER}'..."
+        printf 's3.configure -access_key=%s -secret_key=%s -actions=Admin,Read,Write,List,Tagging -user=%s -apply\n' \
+          "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}" "$${S3_USER}" \
+          | weed shell -master=s3:9333 -filer=s3:8888 > /tmp/s3cfg.out 2>&1 \
+          || { cat /tmp/s3cfg.out >&2; exit 1; }
+        grep -q '"name"' /tmp/s3cfg.out || { cat /tmp/s3cfg.out >&2; exit 1; }
+        echo "[s3-init] ensuring bucket '$${S3_BUCKET}'..."
+        printf 's3.bucket.create -name %s\n' "$${S3_BUCKET}" \
+          | weed shell -master=s3:9333 -filer=s3:8888 > /tmp/s3bucket.out 2>&1 || true
+        if grep -qE 'created bucket|already exists' /tmp/s3bucket.out; then
+          echo "[s3-init] bucket '$${S3_BUCKET}' is ready"
+        else
+          cat /tmp/s3bucket.out >&2
+          exit 1
+        fi
+        echo "[s3-init] done"
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is not set}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is not set}
+      S3_BUCKET: ${S3_BUCKET:-nextcloud}
+      S3_USER: nextcloud
+    networks:
+      - backend
+    depends_on:
+      s3:
+        condition: service_healthy
+
+  # ===========================================================================
+  #  9. ONLYOFFICE Docs — онлайн-редактор (docx/xlsx/pptx) с JWT-защитой.
+  #     Nextcloud-коннектор ONLYOFFICE настраивается в scripts/configure-nextcloud.sh
+  # ===========================================================================
+  onlyoffice:
+    <<: *default-service
+    image: onlyoffice/documentserver:${ONLYOFFICE_VERSION:-8.3.3}
+    container_name: ${COMPOSE_PROJECT_NAME:-cloudsuite}-onlyoffice
+    environment:
+      TZ: ${TZ:-UTC}
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:?ONLYOFFICE_JWT_SECRET is not set}
+      # DS по умолчанию запрещает скачивание документов с приватных адресов,
+      # а extra_hosts резолвит CLOUD_DOMAIN в 172.28.10.10 (сеть edge).
+      ALLOW_PRIVATE_IP_ADDRESS: "true"
+      JWT_HEADER: ${ONLYOFFICE_JWT_HEADER:-Authorization}
+      JWT_IN_BODY: ${ONLYOFFICE_JWT_IN_BODY:-true}
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_lib:/var/lib/onlyoffice
+      - onlyoffice_logs:/var/log/onlyoffice
+    networks:
+      - edge
+    extra_hosts:
+      - "${CLOUD_DOMAIN}:${PROXY_IP:-172.28.10.10}"
+      - "${OFFICE_DOMAIN}:${PROXY_IP:-172.28.10.10}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    stop_grace_period: 60s

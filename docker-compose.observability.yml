@@ -1,0 +1,182 @@
+# =============================================================================
+#  Cloud Suite - optional observability overlay (Loki + Promtail)
+#  -----------------------------------------------------------------------------
+#  Not part of the default stack. Enable it explicitly:
+#
+#    docker compose -f docker-compose.yml -f docker-compose.observability.yml \
+#      --profile observability up -d loki promtail
+#
+#  Grafana is NOT bundled on purpose - point an existing Grafana at
+#  http://127.0.0.1:${LOKI_PORT:-3100} (data source type "Loki").
+#
+#  Both services join the internal "backend" network only; Loki publishes on
+#  127.0.0.1 by default, so nothing new is exposed to the internet.
+# =============================================================================
+name: ${COMPOSE_PROJECT_NAME:-cloudsuite}
+
+x-observability-service: &observability-service
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+  networks:
+    - backend
+
+services:
+  loki:
+    <<: *observability-service
+    image: grafana/loki:${LOKI_VERSION:-3.5.1}
+    profiles: ["observability"]
+    command: -config.file=/etc/loki/loki.yml
+    user: "10001:10001"
+    ports:
+      - "${LOKI_BIND:-127.0.0.1}:${LOKI_PORT:-3100}:3100"
+    volumes:
+      - loki_data:/loki
+    configs:
+      - source: loki_config
+        target: /etc/loki/loki.yml
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3100/ready | grep -q ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  promtail:
+    <<: *observability-service
+    image: grafana/promtail:${PROMTAIL_VERSION:-3.5.1}
+    profiles: ["observability"]
+    command: -config.file=/etc/promtail/promtail.yml
+    # Needs the host docker socket and log files to discover containers.
+    user: "0:0"
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./logs:/host-logs:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    configs:
+      - source: promtail_config
+        target: /etc/promtail/promtail.yml
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  loki_data:
+    name: ${COMPOSE_PROJECT_NAME:-cloudsuite}_loki_data
+
+configs:
+  loki_config:
+    content: |
+      auth_enabled: false
+
+      server:
+        http_listen_port: 3100
+        log_level: warn
+
+      common:
+        path_prefix: /loki
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+
+      ingester:
+        chunk_idle_period: 5m
+        chunk_block_size: 262144
+        chunk_target_size: 1536000
+        max_chunk_age: 1h
+        flush_check_period: 10s
+
+      schema_config:
+        configs:
+          - from: 2024-01-01
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+
+      storage_config:
+        filesystem:
+          directory: /loki/chunks
+        tsdb_shipper:
+          active_index_directory: /loki/tsdb-index
+          cache_location: /loki/tsdb-cache
+
+      compactor:
+        working_directory: /loki/compactor
+        retention_enabled: true
+        delete_request_store: filesystem
+
+      limits_config:
+        retention_period: ${LOKI_RETENTION:-720h}
+        reject_old_samples: false
+        max_query_series: 5000
+        allow_structured_metadata: true
+
+      analytics:
+        reporting_enabled: false
+
+  promtail_config:
+    content: |
+      server:
+        http_listen_port: 9080
+        grpc_listen_port: 0
+        log_level: warn
+
+      positions:
+        filename: /tmp/positions.yaml
+
+      clients:
+        - url: http://loki:3100/loki/api/v1/push
+          backoff_config:
+            min_period: 1s
+            max_period: 30s
+            max_retries: 10
+
+      scrape_configs:
+        # All docker containers of the Cloud Suite project.
+        - job_name: docker
+          docker_sd_configs:
+            - host: unix:///var/run/docker.sock
+              refresh_interval: 30s
+              filters:
+                - name: label
+                  values: ["com.docker.compose.project=${COMPOSE_PROJECT_NAME:-cloudsuite}"]
+          relabel_configs:
+            - source_labels: ["__meta_docker_container_name"]
+              regex: "/(.*)"
+              target_label: container
+            - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+              target_label: service
+            - source_labels: ["__meta_docker_container_label_com_docker_compose_project"]
+              target_label: project
+            - source_labels: ["__meta_docker_container_log_stream"]
+              target_label: stream
+
+        # Host-side files from the bind mounts (edge nginx and Nextcloud logs).
+        # ONLYOFFICE and NPM write into named volumes, which do not exist on the
+        # host - their container stdout is covered by the docker job above.
+        - job_name: cloudsuite-files
+          static_configs:
+            - targets: ["localhost"]
+              labels:
+                job: cloudsuite-files
+                __path__: /host-logs/nginx/*.log
+                origin: nginx
+            - targets: ["localhost"]
+              labels:
+                job: cloudsuite-files
+                __path__: /host-logs/cloudsuite/*.log
+                origin: nextcloud

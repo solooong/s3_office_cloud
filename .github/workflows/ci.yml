@@ -1,0 +1,103 @@
+# =============================================================================
+#  Cloud Suite - continuous integration
+#  -----------------------------------------------------------------------------
+#  Two jobs, both cheap and hermetic:
+#    static  - shellcheck, python compilation, tests/validate.py, make help
+#    compose - renders every compose combination with a throw-away dummy env
+#
+#  No secrets and no running stack are needed.  The staging drill (a real
+#  deployment, backup/restore and migration rehearsal) is manual and documented
+#  in tests/staging/README.md.
+# =============================================================================
+name: ci
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: static validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck python3-yaml make
+          shellcheck --version
+
+      - name: shellcheck all scripts
+        run: make lint
+
+      - name: compile python helpers
+        run: python3 -m py_compile scripts/lib/*.py tests/validate.py
+
+      - name: ensure script modes
+        # A Windows checkout cannot store POSIX modes; restore them for this
+        # job and, once the release commit records 100755, assert the index.
+        run: |
+          chmod +x scripts/*.sh scripts/lib/*.sh tests/*.sh \
+            config/nextcloud/hooks/before-starting/*.sh
+          git ls-files -s scripts/*.sh tests/*.sh \
+            config/nextcloud/hooks/before-starting/*.sh > /tmp/modes.txt || true
+          if [ ! -s /tmp/modes.txt ]; then
+            echo "::warning::scripts are not tracked yet - exec bits will be recorded in the release commit"
+            exit 0
+          fi
+          bad=$(awk '$1 != "100755" {print $4}' /tmp/modes.txt) || true
+          if [ -n "$bad" ]; then
+            echo "::error::these files are not 100755 in the git index:"
+            echo "$bad"
+            echo "fix: git update-index --chmod=+x <file>"
+            exit 1
+          fi
+          echo "git index modes: all 100755"
+
+      - name: repository validation
+        run: python3 tests/validate.py --verbose
+
+      - name: makefile entry point
+        run: |
+          make help
+          make -n up >/dev/null
+          make -n backup >/dev/null
+
+      - name: static gates (bash -n, validate.py, .env.ci render)
+        run: make test SHELLCHECK=shellcheck
+
+  compose:
+    name: compose render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: docker compose version
+        run: docker compose version
+
+      - name: ensure script modes
+        run: |
+          chmod +x scripts/*.sh scripts/lib/*.sh tests/*.sh \
+            config/nextcloud/hooks/before-starting/*.sh
+
+      - name: render every compose combination
+        run: REQUIRE_DOCKER=1 ./tests/compose_render.sh

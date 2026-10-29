@@ -1,0 +1,101 @@
+# ============================================================================
+#  Ролевая модель Cloud Suite (RBAC)
+#  ---------------------------------------------------------------------------
+#  Единственный источник правды для scripts/rbac-sync.sh (make rbac).
+#  Группы Nextcloud создаются/обновляются по этому файлу, квоты применяются
+#  к участникам, лимиты публичных ссылок и права на решаринг настраиваются
+#  через OCS/occ. Изменения применяйте командой:  make rbac  (--dry-run: make rbac DRY_RUN=1)
+#
+#  ВАЖНО: имена групп (name) — это идентификаторы Nextcloud. Латиница, цифры,
+#  "-", "_", ".", "@". Не переименовывайте существующие группы без миграции:
+#  переименование = создание новой группы и потеря общих папок.
+# ============================================================================
+version: 1
+
+# Политики по умолчанию для всех ролей (роль может переопределить любую).
+defaults:
+  # Квота по умолчанию для пользователя без явно назначенной роли.
+  default_quota: "10GB"
+  # Требовать пароль для всех публичных ссылок (рекомендация ИБ).
+  enforce_link_password: true
+  # Срок жизни публичной ссылки по умолчанию, дней (0 = бессрочно, запрещено).
+  link_expire_days: 30
+  # Разрешать публичные ссылки с правом редактирования.
+  allow_public_edit: true
+  # Разрешать получателям перешаривать файлы дальше.
+  resharing: true
+  # Разрешать федеративные (межустановочные) шары — по умолчанию выключено.
+  remote_shares: false
+
+roles:
+  # ------------------------------------------------------------------ admins
+  - name: admins
+    display_name: "Администраторы"
+    description: "Полный доступ к администрированию, не входит в общие папки по умолчанию."
+    quota: "unlimited"
+    # Делегированные администраторы группы (occ group:add-subadmin).
+    delegated_admins: []
+    share:
+      links_allowed: true
+      enforce_password: true
+      default_expire_days: 30
+      public_edit_allowed: true
+      resharing: true
+      remote_shares: false
+
+  # -------------------------------------------------------------- management
+  - name: management
+    display_name: "Руководители подразделений"
+    description: "Делегированные администраторы своих групп, видят отчёты, управляют составом."
+    quota: "500GB"
+    # Руководители становятся sub-admin групп employees/contractors.
+    delegated_admins: []
+    share:
+      links_allowed: true
+      enforce_password: true
+      default_expire_days: 30
+      public_edit_allowed: true
+      resharing: true
+      remote_shares: false
+
+  # --------------------------------------------------------------- employees
+  - name: employees
+    display_name: "Сотрудники"
+    description: "Базовая роль: личное пространство, общие папки отдела, публичные ссылки."
+    quota: "100GB"
+    delegated_admins: []
+    share:
+      links_allowed: true
+      enforce_password: true
+      default_expire_days: 30
+      public_edit_allowed: true
+      resharing: true
+      remote_shares: false
+
+  # -------------------------------------------------------------- contractors
+  - name: contractors
+    display_name: "Внешние подрядчики"
+    description: "Ограниченная роль: только выданные папки, короткие ссылки без права редактирования."
+    quota: "20GB"
+    delegated_admins: []
+    share:
+      links_allowed: true
+      enforce_password: true
+      default_expire_days: 7
+      public_edit_allowed: false
+      resharing: false
+      remote_shares: false
+
+  # ----------------------------------------------------------------- auditors
+  - name: auditors
+    display_name: "Аудиторы / ИБ"
+    description: "Доступ только на чтение к выделенным папкам, без публичных ссылок и без редактирования."
+    quota: "5GB"
+    delegated_admins: []
+    share:
+      links_allowed: false
+      enforce_password: true
+      default_expire_days: 7
+      public_edit_allowed: false
+      resharing: false
+      remote_shares: false

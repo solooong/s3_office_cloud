@@ -1,0 +1,7 @@
+# Rendered by /docker-entrypoint.d/20-envsubst-on-templates.sh at container start.
+# Host allow-list of the Nextcloud virtual host: the public cloud domain and the
+# ONLYOFFICE domain (server-side callbacks). The docker service name `web` is
+# declared statically in conf.d/10-nextcloud.conf, so it is not repeated here
+# (nginx logs "conflicting server name" for duplicates inside one server block).
+# Included from conf.d/10-nextcloud.conf (wildcard include).
+server_name ${CLOUD_DOMAIN} ${OFFICE_DOMAIN};

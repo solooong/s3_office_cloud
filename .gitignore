@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+#  Cloud Suite — что НИКОГДА не попадает в git
+# ---------------------------------------------------------------------------
+# Секреты и локальная конфигурация
+.env
+.env.*
+!.env.example
+!.env.local.example
+!.env.ip.example
+*.pem
+*.key
+!config/**/*.example
+
+# Данные, создаваемые при эксплуатации (named volumes живут отдельно,
+# здесь — только bind-mount каталоги и локальные артефакты)
+data/
+logs/
+backups/
+.dump
+*.dump
+*.tar
+*.tar.gz
+*.tar.zst
+*.sql
+*.sql.gz
+
+# Временные файлы и артефакты валидации
+.tmp*/
+tmp/
+.cache/
+__pycache__/
+*.pyc
+node_modules/
+.shellcheck/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

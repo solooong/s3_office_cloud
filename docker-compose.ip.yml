@@ -1,0 +1,66 @@
+# =============================================================================
+#  Cloud Suite — запуск на «белом» IP без домена и хостинга (overlay)
+#  ---------------------------------------------------------------------------
+#  Дополнительный набор к базовому docker-compose.yml: сервер с публичным IP,
+#  БЕЗ домена, DNS и сертификатов. Вход: http://PUBLIC_IP/ (или :IP_HTTP_PORT).
+#  Это отдельный compose-проект (COMPOSE_PROJECT_NAME=cloudsuite-ip) со своими
+#  томами — продакшн-стек не затрагивается.
+#
+#  Быстрый старт (см. docs/14-ip-run.md):
+#      cp .env.ip.example .env.ip   # вписать PUBLIC_IP
+#      make ip-env                  # заполнить секреты
+#      make ip-up                   # поднять стек
+#      make ip-configure            # occ-настройки + маршрут callback'ов
+#      make ip-check                # проверки GUI и редактора
+#      make ip-down                 # остановить (VOLUMES=1 — удалить данные)
+#
+#  Что меняет overlay:
+#    * proxy (NPM) переводится в профиль "edge" и НЕ стартует: доменов и TLS нет;
+#    * web публикует Nextcloud на IP_BIND:IP_HTTP_PORT (по умолчанию 0.0.0.0:80);
+#    * onlyoffice публикует редактор на IP_BIND:IP_OFFICE_PORT (по умолчанию 8081),
+#      чтобы браузер мог открыть документ (страница и редактор — один http);
+#    * Nextcloud живёт по http://PUBLIC_IP — overwrite-переменные без TLS;
+#    * IP_WEB_IP — статический адрес web в сети edge: на него перенаправляется
+#      PUBLIC_IP:IP_HTTP_PORT внутри docker-сети (scripts/ip-callback-route.sh),
+#      чтобы серверные callback'и ONLYOFFICE работали и без NAT-loopback.
+#
+#  ВНИМАНИЕ: http без TLS. Для доступа из интернета закрывайте порты файрволом
+#  (22, IP_HTTP_PORT, IP_OFFICE_PORT) и/или ставьте TLS-прокси перед стеком —
+#  подробности и ограничения в docs/14-ip-run.md.
+# =============================================================================
+
+services:
+  # NPM не нужен: домена и TLS нет. Профиль "edge" включается только осознанно.
+  proxy:
+    profiles: ["edge"]
+
+  web:
+    environment:
+      # Host allow-list виртуального хоста: публичный IP вместо домена.
+      CLOUD_DOMAIN: ${PUBLIC_IP:?set PUBLIC_IP in .env.ip}
+      OFFICE_DOMAIN: ${PUBLIC_IP:?set PUBLIC_IP in .env.ip}
+    ports:
+      - "${IP_BIND:-0.0.0.0}:${IP_HTTP_PORT:-80}:8080"
+    networks:
+      edge:
+        # Статический адрес, на который ip-callback-route.sh перенаправляет
+        # PUBLIC_IP:IP_HTTP_PORT (см. IP_WEB_IP в .env.ip).
+        ipv4_address: ${IP_WEB_IP:-172.28.10.12}
+
+  app:
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: "${PUBLIC_IP:?set PUBLIC_IP in .env.ip} localhost 127.0.0.1 web"
+      OVERWRITEPROTOCOL: http
+      OVERWRITEHOST: "${PUBLIC_HOST:?set PUBLIC_HOST in .env.ip (PUBLIC_IP, with :PORT when not 80)}"
+      OVERWRITECLIURL: "http://${PUBLIC_HOST:?set PUBLIC_HOST in .env.ip}"
+
+  cron:
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: "${PUBLIC_IP:?set PUBLIC_IP in .env.ip} localhost 127.0.0.1 web"
+      OVERWRITEPROTOCOL: http
+      OVERWRITEHOST: "${PUBLIC_HOST:?set PUBLIC_HOST in .env.ip (PUBLIC_IP, with :PORT when not 80)}"
+      OVERWRITECLIURL: "http://${PUBLIC_HOST:?set PUBLIC_HOST in .env.ip}"
+
+  onlyoffice:
+    ports:
+      - "${IP_BIND:-0.0.0.0}:${IP_OFFICE_PORT:-8081}:80"

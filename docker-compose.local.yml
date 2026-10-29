@@ -1,0 +1,68 @@
+# =============================================================================
+#  Cloud Suite — локальный запуск БЕЗ домена и БЕЗ TLS (overlay)
+#  ---------------------------------------------------------------------------
+#  Это не продакшн-профиль: он нужен, чтобы поднять весь стек на ноутбуке,
+#  открыть web-GUI в браузере по локальному имени и проверить файлы, версии,
+#  шары и редактор. Публичный домен, DNS, Let's Encrypt и Nginx Proxy Manager
+#  не используются.
+#
+#  Запуск (через make):
+#      make local-env        # .env.local из шаблона + секреты
+#      make local-up         # docker compose -f docker-compose.yml -f docker-compose.local.yml
+#      make local-configure  # occ-настройки под локальные URL
+#  Остановка:
+#      make local-down
+#
+#  Что меняет overlay:
+#    * proxy (NPM) переводится в профиль "edge" и НЕ стартует;
+#    * web публикует Nextcloud на 127.0.0.1:${LOCAL_HTTP_PORT:-8080};
+#    * onlyoffice публикует редактор на 127.0.0.1:${LOCAL_OFFICE_PORT:-8081};
+#    * Nextcloud живёт по http на имени http://${LOCAL_HOST:-cloud.local}:8080;
+#      имя берётся не из зоны *.localhost: браузеры и curl принудительно шлют
+#      такую зону в loopback, игнорируя /etc/hosts, и ONLYOFFICE не смог бы
+#      достучаться до callback-URL. Одна запись в hosts на рабочей машине —
+#      `make local-hosts` (контейнеры получают имя через extra_hosts);
+#    * LOCAL_WEB_IP — статический адрес web в сети edge; PROXY_IP в .env.local
+#      задан тем же значением, поэтому extra_hosts резолвит локальное имя в web
+#      и серверные callback'и ONLYOFFICE (`http://cloud.local:8080/...`)
+#      доходят до Nextcloud.
+#
+#  Все порты слушают только loopback. Ничего не публикуется в сеть.
+# =============================================================================
+
+services:
+  # NPM не нужен: TLS и домены отсутствуют. Профиль "edge" включается только
+  # осознанно (docker compose --profile edge ...), по умолчанию не стартует.
+  proxy:
+    profiles: ["edge"]
+
+  web:
+    environment:
+      # Host allow-list виртуального хоста: локальное имя вместо публичного домена.
+      CLOUD_DOMAIN: ${LOCAL_HOST:-cloud.local}
+      OFFICE_DOMAIN: ${LOCAL_OFFICE_HOST:-office.local}
+    ports:
+      - "127.0.0.1:${LOCAL_HTTP_PORT:-8080}:8080"
+    networks:
+      edge:
+        # Статический адрес, чтобы extra_hosts в app/cron/onlyoffice указывал
+        # на web (см. PROXY_IP в .env.local).
+        ipv4_address: ${LOCAL_WEB_IP:-172.28.10.11}
+
+  app:
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: "${LOCAL_HOST:-cloud.local} localhost 127.0.0.1 web"
+      OVERWRITEPROTOCOL: http
+      OVERWRITEHOST: "${LOCAL_HOST:-cloud.local}:${LOCAL_HTTP_PORT:-8080}"
+      OVERWRITECLIURL: "http://${LOCAL_HOST:-cloud.local}:${LOCAL_HTTP_PORT:-8080}"
+
+  cron:
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: "${LOCAL_HOST:-cloud.local} localhost 127.0.0.1 web"
+      OVERWRITEPROTOCOL: http
+      OVERWRITEHOST: "${LOCAL_HOST:-cloud.local}:${LOCAL_HTTP_PORT:-8080}"
+      OVERWRITECLIURL: "http://${LOCAL_HOST:-cloud.local}:${LOCAL_HTTP_PORT:-8080}"
+
+  onlyoffice:
+    ports:
+      - "127.0.0.1:${LOCAL_OFFICE_PORT:-8081}:80"

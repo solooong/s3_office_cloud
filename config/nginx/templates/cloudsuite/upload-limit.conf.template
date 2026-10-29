@@ -1,0 +1,6 @@
+# Rendered by /docker-entrypoint.d/20-envsubst-on-templates.sh at container start.
+# Source of truth: PHP_UPLOAD_LIMIT (.env) -> docker-compose environment (web).
+# Included at SERVER level from conf.d/10-nextcloud.conf; when the template is
+# not rendered (plain `nginx -t` on a bare checkout) the static default from
+# snippets/upload-limit.conf (http level) applies instead.
+client_max_body_size ${PHP_UPLOAD_LIMIT};

@@ -1,0 +1,51 @@
+# =============================================================================
+#  Cloud Suite - log rotation (install to /etc/logrotate.d/cloudsuite)
+#  -----------------------------------------------------------------------------
+#  Both stanzas use copytruncate: nginx and php-fpm (Nextcloud) run inside
+#  containers, hold their log files open and cannot be signalled from the host,
+#  so the file is copied and truncated in place instead of being renamed.
+#
+#  Only the two host-bind-mounted log directories are rotated here:
+#    ./logs/nginx      -> /var/log/nginx in the web container
+#    ./logs/cloudsuite -> /var/log/cloudsuite in the app and cron containers
+#  ONLYOFFICE and Nginx Proxy Manager write into named volumes and rotate
+#  their own logs; there is no host directory to rotate for them.
+#
+#  Install:
+#    sudo install -m 644 config/logrotate/cloudsuite /etc/logrotate.d/cloudsuite
+#    sudo logrotate --debug /etc/logrotate.d/cloudsuite   # dry run
+#    sudo logrotate --force /etc/logrotate.d/cloudsuite   # rotate now (test)
+#
+#  Paths assume the stack lives in /opt/cloudsuite; scripts/bootstrap.sh prints
+#  the exact sed command if your checkout is elsewhere.
+# =============================================================================
+
+/opt/cloudsuite/logs/nginx/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+}
+
+# nextcloud.log, audit.log and any prune/update logs written by the host.
+/opt/cloudsuite/logs/cloudsuite/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    create 0640 33 33
+}
+
+# Nginx Proxy Manager and ONLYOFFICE keep their logs inside named volumes
+# (proxy_data, onlyoffice_logs) and rotate them themselves - no host directory
+# is bind-mounted, so there is nothing to rotate here.
